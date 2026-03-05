@@ -1,128 +1,89 @@
 import os
-import time
-import requests
+import json
+import asyncio
+from datetime import datetime
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+import gspread
+from google.oauth2.service_account import Credentials
 
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
-EDGE_MIN_CENTS = int(os.getenv("EDGE_MIN_CENTS", "3"))   # alert if (100 - (yes_ask + no_ask)) >= this
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "5000"))
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-
-def tg_send(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    r = requests.post(url, data=payload, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram send failed {r.status_code}: {r.text}")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "BETS")
+SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 
-def fetch_markets(limit=200, cursor=None):
-    params = {"limit": limit}
-    if cursor:
-        params["cursor"] = cursor
-    r = requests.get(KALSHI_MARKETS_URL, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+def get_sheet():
+    if not SA_JSON:
+        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not SHEET_ID:
+        raise RuntimeError("Missing GOOGLE_SHEET_ID")
+
+    info = json.loads(SA_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    client = gspread.authorize(creds)
+    sh = client.open_by_key(SHEET_ID)
+    ws = sh.worksheet(SHEET_TAB)
+    return ws
 
 
-def is_good_market(m: dict) -> bool:
-    # Filter out dead markets
-    vol = m.get("volume") or 0
-    if vol < MIN_VOLUME:
-        return False
-
-    status = (m.get("status") or "").lower()
-    # keep if open/active-like; if empty, we still allow
-    if status and status not in {"open", "active", "trading"}:
-        # if Kalshi uses different statuses, this avoids closed/settled ones
-        return False
-
-    # Need both asks in cents
-    yes_ask = m.get("yes_ask")
-    no_ask = m.get("no_ask")
-    if not isinstance(yes_ask, int) or not isinstance(no_ask, int):
-        return False
-
-    # Asks should be realistic
-    if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
-        return False
-
-    return True
+async def send_telegram(app, text: str):
+    # Sends a message even if you didn't /start recently (because we use CHAT_ID)
+    if not CHAT_ID:
+        return
+    await app.bot.send_message(chat_id=int(CHAT_ID), text=text)
 
 
-def compute_edge_cents(m: dict) -> int:
-    yes_ask = m["yes_ask"]
-    no_ask = m["no_ask"]
-    return 100 - (yes_ask + no_ask)  # positive = “cheap” combined asks
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Bot is running.")
+
+
+async def test_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ws = get_sheet()
+
+    # Add a test row to your BETS tab
+    now = datetime.utcnow().isoformat()
+    row = [
+        f"test_{int(datetime.utcnow().timestamp())}",  # bet_id
+        now,                                          # timestamp
+        "TEST_TICKER",                                # ticker
+        0,                                            # edge_cents
+        "",                                           # yes_ask
+        "",                                           # no_ask
+        0,                                            # suggested_bet
+        "",                                           # bankroll_before
+        "TEST",                                       # action
+        "",                                           # result
+        "",                                           # profit_loss
+        "",                                           # bankroll_after
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+    await update.message.reply_text("✅ Wrote a test row to Google Sheets.")
+    await send_telegram(context.application, "✅ Kalshi Edge Bot: Google Sheets connected (test row written).")
+
+
+async def on_startup(app):
+    # Sends you a message on deploy/restart (this is the “automatic notification” part)
+    await send_telegram(app, "✅ Kalshi Edge Bot is ONLINE")
 
 
 def main():
-    tg_send("✅ Kalshi Alert Bot ONLINE (scanning public markets)")
+    if not TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
-    # prevent spam: remember alerts we've already sent recently
-    alerted = {}  # ticker -> last_sent_epoch
-    cooldown = 20 * 60  # 20 minutes
-
-    while True:
-        try:
-            found = []
-            cursor = None
-            pages = 0
-
-            # scan a few pages each loop so it’s fast + not too spammy
-            # (increase pages if you want later)
-            while pages < 3:
-                data = fetch_markets(limit=200, cursor=cursor)
-                markets = data.get("markets", [])
-                cursor = data.get("cursor")
-                pages += 1
-
-                for m in markets:
-                    if not is_good_market(m):
-                        continue
-
-                    edge = compute_edge_cents(m)
-                    if edge < EDGE_MIN_CENTS:
-                        continue
-
-                    ticker = m.get("ticker") or ""
-                    title = m.get("title") or ticker
-                    vol = m.get("volume") or 0
-
-                    now = int(time.time())
-                    last = alerted.get(ticker, 0)
-                    if now - last < cooldown:
-                        continue
-
-                    alerted[ticker] = now
-                    found.append((edge, title, ticker, m["yes_ask"], m["no_ask"], vol))
-
-                if not cursor:
-                    break
-
-            # send top 3 best edges
-            if found:
-                found.sort(reverse=True, key=lambda x: x[0])
-                for edge, title, ticker, yes_ask, no_ask, vol in found[:3]:
-                    tg_send(
-                        f"🚨 KALSHI EDGE\n"
-                        f"{title}\n"
-                        f"Ticker: {ticker}\n"
-                        f"YES ask: {yes_ask}c | NO ask: {no_ask}c\n"
-                        f"Edge: {edge}c | Vol: {vol}"
-                    )
-
-        except Exception as e:
-            tg_send(f"❌ Scanner error: {type(e).__name__}: {e}")
-
-        time.sleep(SCAN_SECONDS)
+    app = ApplicationBuilder().token(TOKEN).post_init(on_startup).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("testsheet", test_sheet))
+    app.run_polling()
 
 
 if __name__ == "__main__":
