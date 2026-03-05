@@ -1,59 +1,29 @@
 import os
-import requests
 import time
-from telegram import Bot
+import requests
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-bot = Bot(token=TOKEN)
+# Optional for later (keep it for now)
+KALSHI_TICKER = os.getenv("KALSHI_TICKER", "")
 
-def get_markets():
-    url = "https://api.elections.kalshi.com/trade-api/v2/markets"
-    r = requests.get(url)
-    return r.json()["markets"]
+def tg_send(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise Exception("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
-def find_edges():
-    markets = get_markets()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    r = requests.post(url, data=payload, timeout=20)
+    if r.status_code != 200:
+        raise Exception(f"Telegram error {r.status_code}: {r.text}")
 
-    edges = []
+def main():
+    tg_send("✅ Kalshi Edge Bot is ONLINE")
 
-    for m in markets:
-        yes_ask = m.get("yes_ask")
-        no_ask = m.get("no_ask")
+    # keepalive loop (we’ll replace this with Kalshi scanning next)
+    while True:
+        time.sleep(60)
 
-        if yes_ask and no_ask:
-            total = yes_ask + no_ask
-
-            if total < 99:  # inefficiency
-                edges.append({
-                    "title": m["title"],
-                    "yes": yes_ask,
-                    "no": no_ask,
-                    "edge": 100 - total
-                })
-
-    return edges
-
-def send(msg):
-    bot.send_message(chat_id=CHAT_ID, text=msg)
-
-send("✅ Kalshi Edge Bot Running")
-
-while True:
-    try:
-        edges = find_edges()
-
-        for e in edges[:3]:
-            send(
-                f"🚨 Edge Found\n\n"
-                f"{e['title']}\n"
-                f"YES ask: {e['yes']}\n"
-                f"NO ask: {e['no']}\n"
-                f"Edge: {e['edge']}%"
-            )
-
-    except Exception as e:
-        send(f"Error: {e}")
-
-    time.sleep(120)
+if __name__ == "__main__":
+    main()
