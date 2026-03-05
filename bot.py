@@ -1,75 +1,63 @@
 import os
-import json
-import time
 import requests
+import json
 from datetime import datetime
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-import gspread
-from google.oauth2.service_account import Credentials
-
-
-# TELEGRAM
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# GOOGLE SHEETS
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "BETS")
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Kalshi Edge Bot Online")
 
+async def odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
-    requests.post(url, json=payload)
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={ODDS_API_KEY}&regions=us&markets=h2h,spreads,totals&bookmakers=pinnacle"
 
+    response = requests.get(url)
+    data = response.json()
 
-def get_sheet():
-    creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
+    if len(data) == 0:
+        await update.message.reply_text("No games found")
+        return
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    game = data[0]
 
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(creds)
+    home = game["home_team"]
+    away = game["away_team"]
 
-    sheet = client.open_by_key(SHEET_ID)
-    return sheet.worksheet(SHEET_TAB)
+    bookmakers = game["bookmakers"][0]
+    markets = bookmakers["markets"]
 
+    message = f"🏀 Pinnacle Odds\n{away} @ {home}\n\n"
 
-def write_test_row():
-    sheet = get_sheet()
-    row = [
-        f"test_{int(time.time())}",
-        datetime.utcnow().isoformat(),
-        "TEST_TICKER",
-        0,
-        "",
-        "",
-        0,
-        "",
-        "TEST",
-        "",
-        "",
-        "",
-    ]
-    sheet.append_row(row)
+    for market in markets:
 
+        if market["key"] == "h2h":
+            for outcome in market["outcomes"]:
+                message += f"{outcome['name']} ML: {outcome['price']}\n"
+
+        if market["key"] == "spreads":
+            for outcome in market["outcomes"]:
+                message += f"{outcome['name']} {outcome['point']} ({outcome['price']})\n"
+
+        if market["key"] == "totals":
+            for outcome in market["outcomes"]:
+                message += f"{outcome['name']} {outcome['point']} ({outcome['price']})\n"
+
+    await update.message.reply_text(message)
 
 def main():
-    send_telegram("✅ Kalshi Edge Bot is ONLINE")
 
-    try:
-        write_test_row()
-        send_telegram("✅ Google Sheets connection SUCCESS")
-    except Exception as e:
-        send_telegram(f"❌ Sheets error: {str(e)}")
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    while True:
-        time.sleep(60)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("odds", odds))
 
+    print("Bot running...")
+
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
