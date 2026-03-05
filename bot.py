@@ -1,32 +1,59 @@
 import os
-import asyncio
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import requests
+import time
+from telegram import Bot
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-async def send_startup_message(app):
-    await asyncio.sleep(5)
-    await app.bot.send_message(chat_id=CHAT_ID, text="✅ Kalshi Edge Bot is ONLINE")
+bot = Bot(token=TOKEN)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot is running.")
+def get_markets():
+    url = "https://api.elections.kalshi.com/trade-api/v2/markets"
+    r = requests.get(url)
+    return r.json()["markets"]
 
-async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello from Kalshi Edge Bot.")
+def find_edges():
+    markets = get_markets()
 
-async def on_startup(app):
-    asyncio.create_task(send_startup_message(app))
+    edges = []
 
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    for m in markets:
+        yes_ask = m.get("yes_ask")
+        no_ask = m.get("no_ask")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("hello", hello))
+        if yes_ask and no_ask:
+            total = yes_ask + no_ask
 
-    app.post_init = on_startup
-    app.run_polling()
+            if total < 99:  # inefficiency
+                edges.append({
+                    "title": m["title"],
+                    "yes": yes_ask,
+                    "no": no_ask,
+                    "edge": 100 - total
+                })
 
-if __name__ == "__main__":
-    main()
+    return edges
+
+def send(msg):
+    bot.send_message(chat_id=CHAT_ID, text=msg)
+
+send("✅ Kalshi Edge Bot Running")
+
+while True:
+    try:
+        edges = find_edges()
+
+        for e in edges[:3]:
+            send(
+                f"🚨 Edge Found\n\n"
+                f"{e['title']}\n"
+                f"YES ask: {e['yes']}\n"
+                f"NO ask: {e['no']}\n"
+                f"Edge: {e['edge']}%"
+            )
+
+    except Exception as e:
+        send(f"Error: {e}")
+
+    time.sleep(120)
