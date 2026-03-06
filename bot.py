@@ -11,7 +11,7 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 ODDS_API = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
-KALSHI_MARKETS_API = "https://api.elections.kalshi.com/trade-api/v2/markets"
+KALSHI_EVENTS_API = "https://api.elections.kalshi.com/trade-api/v2/events"
 
 REQUEST_TIMEOUT = 20
 POLL_INTERVAL_SEC = 3
@@ -23,6 +23,12 @@ last_update_id = None
 # =====================
 # HELPERS
 # =====================
+def cut(text: str) -> str:
+    if len(text) <= MAX_TELEGRAM_LEN:
+        return text
+    return text[:MAX_TELEGRAM_LEN] + "\n\n...message cut off"
+
+
 def must_env():
     missing = []
     if not TELEGRAM_BOT_TOKEN:
@@ -35,10 +41,51 @@ def must_env():
         raise RuntimeError("Missing env vars: " + ", ".join(missing))
 
 
-def cut(text: str) -> str:
-    if len(text) <= MAX_TELEGRAM_LEN:
-        return text
-    return text[:MAX_TELEGRAM_LEN] + "\n\n...message cut off"
+def norm_team(name: str) -> str:
+    if not name:
+        return ""
+    x = name.lower().strip()
+    replacements = {
+        "trail blazers": "blazers",
+        "76ers": "sixers",
+        "la clippers": "clippers",
+        "los angeles clippers": "clippers",
+        "la lakers": "lakers",
+        "los angeles lakers": "lakers",
+        "new york knicks": "knicks",
+        "golden state warriors": "warriors",
+        "minnesota timberwolves": "timberwolves",
+        "san antonio spurs": "spurs",
+        "phoenix suns": "suns",
+        "miami heat": "heat",
+        "brooklyn nets": "nets",
+        "orlando magic": "magic",
+        "houston rockets": "rockets",
+        "new orleans pelicans": "pelicans",
+        "sacramento kings": "kings",
+        "toronto raptors": "raptors",
+        "detroit pistons": "pistons",
+        "chicago bulls": "bulls",
+        "utah jazz": "jazz",
+        "washington wizards": "wizards",
+        "dallas mavericks": "mavericks",
+        "boston celtics": "celtics",
+        "denver nuggets": "nuggets",
+        "charlotte hornets": "hornets",
+        "atlanta hawks": "hawks",
+        "milwaukee bucks": "bucks",
+        "cleveland cavaliers": "cavaliers",
+        "memphis grizzlies": "grizzlies",
+        "oklahoma city thunder": "thunder",
+        "indiana pacers": "pacers",
+        "philadelphia 76ers": "sixers",
+    }
+    for k, v in replacements.items():
+        if k in x:
+            return v
+
+    parts = x.split()
+    return parts[-1] if parts else x
 
 
 # =====================
@@ -68,9 +115,9 @@ def get_updates():
 
 
 # =====================
-# ODDS API (PINNACLE)
+# PINNACLE ODDS
 # =====================
-def get_pinnacle_odds():
+def get_pinnacle_games():
     params = {
         "apiKey": ODDS_API_KEY,
         "bookmakers": "pinnacle",
@@ -110,24 +157,24 @@ def get_pinnacle_odds():
         if home_price is None or away_price is None:
             continue
 
-        games.append(
-            {
-                "home": home,
-                "away": away,
-                "home_price": home_price,
-                "away_price": away_price,
-            }
-        )
+        games.append({
+            "home": home,
+            "away": away,
+            "home_key": norm_team(home),
+            "away_key": norm_team(away),
+            "home_price": home_price,
+            "away_price": away_price,
+        })
 
     return games
 
 
 def odds_command():
-    games = get_pinnacle_odds()
+    games = get_pinnacle_games()
     if not games:
         return "No NBA Pinnacle odds found."
 
-    lines = [f"🏀 Pinnacle NBA Odds (games={len(games)})"]
+    lines = [f"🏀 Pinnacle NBA Odds ({len(games)} games)"]
     for g in games:
         lines.append(
             f"{g['away']} @ {g['home']}\n"
@@ -139,52 +186,134 @@ def odds_command():
 
 
 # =====================
-# KALSHI
+# KALSHI EVENTS
 # =====================
-def get_kalshi_markets(status="open", limit=200):
-    # Kalshi supports market data endpoints; we’ll just fetch and print what we get.
+def get_kalshi_open_events():
     params = {
-        "status": status,
-        "limit": limit,
+        "status": "open",
+        "with_nested_markets": "true",
+        "limit": 200,
     }
-    r = requests.get(KALSHI_MARKETS_API, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("markets", [])
+
+    all_events = []
+    cursor = None
+
+    for _ in range(10):  # enough pages for tonight
+        p = dict(params)
+        if cursor:
+            p["cursor"] = cursor
+
+        r = requests.get(KALSHI_EVENTS_API, params=p, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+
+        events = data.get("events", [])
+        all_events.extend(events)
+
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+
+    return all_events
+
+
+def event_matches_game(event, game):
+    text = " ".join([
+        str(event.get("title", "")),
+        str(event.get("sub_title", "")),
+        str(event.get("event_ticker", "")),
+    ]).lower()
+
+    return game["home_key"] in text and game["away_key"] in text
+
+
+def market_kind(title: str):
+    t = (title or "").lower()
+
+    if ":" in t:
+        return None  # skip player props
+
+    if "points scored" in t or "over " in t or "under " in t:
+        return "total"
+
+    if "wins by over" in t:
+        return "spread"
+
+    if t.startswith("yes ") or t.startswith("no "):
+        if " wins by over" not in t and " points scored" not in t and ":" not in t:
+            return "money"
+
+    if " wins" in t and "wins by over" not in t:
+        return "money"
+
+    return None
+
+
+def get_tonight_kalshi_markets():
+    games = get_pinnacle_games()
+    if not games:
+        return []
+
+    events = get_kalshi_open_events()
+    found = []
+
+    seen = set()
+
+    for game in games:
+        for event in events:
+            if not event_matches_game(event, game):
+                continue
+
+            event_title = event.get("title", "No event title")
+            for m in event.get("markets", []):
+                title = m.get("title", "")
+                kind = market_kind(title)
+                if not kind:
+                    continue
+
+                ticker = m.get("ticker")
+                yes_ask = m.get("yes_ask")
+                yes_bid = m.get("yes_bid")
+
+                if not ticker:
+                    continue
+
+                key = (game["away"], game["home"], ticker)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                found.append({
+                    "game": f"{game['away']} @ {game['home']}",
+                    "event_title": event_title,
+                    "market_title": title,
+                    "kind": kind,
+                    "ticker": ticker,
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                })
+
+    return found
 
 
 def kalshi_command():
-    markets = get_kalshi_markets(status="open", limit=200)
+    markets = get_tonight_kalshi_markets()
 
     if not markets:
-        return "Kalshi returned 0 open markets (unexpected)."
+        return "No matching Kalshi NBA markets found for tonight."
 
-    lines = [f"🎯 Kalshi Markets (open={len(markets)})", "Showing first 25:"]
+    lines = [f"🎯 Tonight Kalshi NBA Markets ({len(markets)})"]
 
-    shown = 0
+    count = 0
     for m in markets:
-        title = m.get("title") or "NO TITLE"
-        ticker = m.get("ticker") or "NO TICKER"
-
-        # Kalshi often uses cents; sometimes fields differ by endpoint/version.
-        yes_ask = m.get("yes_ask")
-        yes_bid = m.get("yes_bid")
-        last_price = m.get("last_price")
-
-        price_bits = []
-        if yes_bid is not None:
-            price_bits.append(f"yes_bid={yes_bid}")
-        if yes_ask is not None:
-            price_bits.append(f"yes_ask={yes_ask}")
-        if last_price is not None and not price_bits:
-            price_bits.append(f"last={last_price}")
-        if not price_bits:
-            price_bits.append("no price fields")
-
-        lines.append(f"{title}\n{ticker}\n{', '.join(price_bits)}")
-
-        shown += 1
-        if shown >= 25:
+        lines.append(
+            f"{m['game']}\n"
+            f"{m['kind'].upper()} | {m['market_title']}\n"
+            f"{m['ticker']}\n"
+            f"yes_bid={m['yes_bid']} yes_ask={m['yes_ask']}"
+        )
+        count += 1
+        if count >= 30:
             break
 
     return "\n\n".join(lines)
@@ -204,14 +333,17 @@ def handle_updates():
         chat = msg.get("chat", {})
         text = (msg.get("text") or "").strip()
 
-        # only respond in your configured chat
         if str(chat.get("id")) != str(TELEGRAM_CHAT_ID):
             continue
 
         cmd = text.lower()
 
         if cmd == "/start":
-            send_message("Bot running\n\n/odds = NBA odds (Pinnacle)\n/kalshi = show first 25 Kalshi markets")
+            send_message(
+                "Bot running\n\n"
+                "/odds = NBA Pinnacle odds\n"
+                "/kalshi = tonight Kalshi NBA markets"
+            )
 
         elif cmd == "/odds":
             send_message(odds_command())
@@ -225,6 +357,7 @@ def handle_updates():
 # =====================
 def main():
     must_env()
+
     try:
         send_message("✅ Bot started")
     except Exception as e:
