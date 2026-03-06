@@ -1,50 +1,26 @@
 import os
-import json
 import time
 import requests
 
 # =========================
-# ENV VARS
+# ENV
 # =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-KALSHI_TICKERS_RAW = os.getenv("KALSHI_TICKERS", "{}")
 
-# Example KALSHI_TICKERS env var:
-# {
-#   "Los Angeles Lakers": "YOUR_LAKERS_TICKER",
-#   "Boston Celtics": "YOUR_CELTICS_TICKER",
-#   "Miami Heat": "YOUR_HEAT_TICKER",
-#   "New York Knicks": "YOUR_KNICKS_TICKER"
-# }
-
-try:
-    KALSHI_TICKERS = json.loads(KALSHI_TICKERS_RAW)
-except Exception:
-    KALSHI_TICKERS = {}
-
-# =========================
-# SETTINGS
-# =========================
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-EDGE_THRESHOLD = 0.03       # 3%
-SCAN_INTERVAL = 120         # seconds
-COMMAND_POLL_INTERVAL = 5   # seconds
 REQUEST_TIMEOUT = 20
+COMMAND_POLL_INTERVAL = 5
 
-# Prevent duplicate alert spam
-already_alerted = set()
-
-# Telegram getUpdates offset tracking
 last_update_id = None
 
 
 # =========================
-# BASIC VALIDATION
+# BASIC CHECK
 # =========================
 def validate_env():
     missing = []
@@ -56,7 +32,7 @@ def validate_env():
         missing.append("ODDS_API_KEY")
 
     if missing:
-        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+        raise RuntimeError("Missing env vars: " + ", ".join(missing))
 
 
 # =========================
@@ -77,9 +53,7 @@ def get_telegram_updates():
     global last_update_id
 
     url = f"{TELEGRAM_API_BASE}/getUpdates"
-    params = {
-        "timeout": 1
-    }
+    params = {"timeout": 1}
 
     if last_update_id is not None:
         params["offset"] = last_update_id + 1
@@ -124,8 +98,7 @@ def get_nba_pinnacle_games():
         if not markets:
             continue
 
-        market = markets[0]
-        outcomes = market.get("outcomes", [])
+        outcomes = markets[0].get("outcomes", [])
         if len(outcomes) < 2:
             continue
 
@@ -143,10 +116,8 @@ def get_nba_pinnacle_games():
             continue
 
         games.append({
-            "id": event.get("id"),
             "home_team": home_team,
             "away_team": away_team,
-            "commence_time": event.get("commence_time"),
             "home_price": home_price,
             "away_price": away_price
         })
@@ -154,45 +125,6 @@ def get_nba_pinnacle_games():
     return games
 
 
-# =========================
-# KALSHI
-# =========================
-def get_kalshi_market(ticker):
-    url = f"{KALSHI_API_BASE}/markets/{ticker}"
-    r = requests.get(url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-
-    # Handle either {"market": {...}} or direct object
-    if isinstance(data, dict) and "market" in data:
-        return data["market"]
-
-    return data
-
-
-def get_kalshi_yes_ask_prob(ticker):
-    market = get_kalshi_market(ticker)
-    yes_ask = market.get("yes_ask")
-
-    if yes_ask is None:
-        return None
-
-    return float(yes_ask) / 100.0
-
-
-# =========================
-# MATH
-# =========================
-def american_to_prob(odds):
-    odds = float(odds)
-    if odds > 0:
-        return 100 / (odds + 100)
-    return abs(odds) / (abs(odds) + 100)
-
-
-# =========================
-# COMMAND OUTPUTS
-# =========================
 def odds_command():
     games = get_nba_pinnacle_games()
 
@@ -208,119 +140,92 @@ def odds_command():
             f"{g['home_team']}: {g['home_price']}"
         )
 
-    return "\n\n".join(lines)
+    msg = "\n\n".join(lines)
 
+    if len(msg) > 3500:
+        msg = msg[:3500] + "\n\n...message cut off"
 
-def find_edges():
-    games = get_nba_pinnacle_games()
-    edges = []
-
-    for g in games:
-        home_team = g["home_team"]
-        away_team = g["away_team"]
-
-        home_prob = american_to_prob(g["home_price"])
-        away_prob = american_to_prob(g["away_price"])
-
-        home_ticker = KALSHI_TICKERS.get(home_team)
-        away_ticker = KALSHI_TICKERS.get(away_team)
-
-        # Home side
-        if home_ticker:
-            try:
-                kalshi_prob = get_kalshi_yes_ask_prob(home_ticker)
-                if kalshi_prob is not None:
-                    edge = home_prob - kalshi_prob
-                    if edge >= EDGE_THRESHOLD:
-                        edges.append({
-                            "game": f"{away_team} @ {home_team}",
-                            "team": home_team,
-                            "ticker": home_ticker,
-                            "pinnacle_price": g["home_price"],
-                            "pinnacle_prob": home_prob,
-                            "kalshi_prob": kalshi_prob,
-                            "edge": edge
-                        })
-            except Exception as e:
-                print(f"Kalshi lookup failed for {home_ticker}: {e}")
-
-        # Away side
-        if away_ticker:
-            try:
-                kalshi_prob = get_kalshi_yes_ask_prob(away_ticker)
-                if kalshi_prob is not None:
-                    edge = away_prob - kalshi_prob
-                    if edge >= EDGE_THRESHOLD:
-                        edges.append({
-                            "game": f"{away_team} @ {home_team}",
-                            "team": away_team,
-                            "ticker": away_ticker,
-                            "pinnacle_price": g["away_price"],
-                            "pinnacle_prob": away_prob,
-                            "kalshi_prob": kalshi_prob,
-                            "edge": edge
-                        })
-            except Exception as e:
-                print(f"Kalshi lookup failed for {away_ticker}: {e}")
-
-    return edges
-
-
-def edge_command():
-    edges = find_edges()
-
-    if not edges:
-        return "No edge found right now."
-
-    lines = ["📈 Kalshi Edges Found"]
-
-    for e in edges:
-        lines.append(
-            f"{e['game']}\n"
-            f"Side: {e['team']}\n"
-            f"Ticker: {e['ticker']}\n"
-            f"Pinnacle ML: {e['pinnacle_price']}\n"
-            f"Pinnacle Prob: {e['pinnacle_prob']:.3f}\n"
-            f"Kalshi YES Ask: {e['kalshi_prob']:.3f}\n"
-            f"Edge: {e['edge'] * 100:.2f}%"
-        )
-
-    return "\n\n".join(lines)
+    return msg
 
 
 # =========================
-# ALERT SCAN
+# KALSHI
 # =========================
-def scan_and_alert():
-    edges = find_edges()
+def get_kalshi_markets():
+    url = f"{KALSHI_API_BASE}/markets"
+    params = {
+        "status": "open"
+    }
 
-    for e in edges:
-        key = f"{e['ticker']}"
+    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
 
-        if key in already_alerted:
-            continue
+    return data.get("markets", [])
 
-        msg = (
-            f"📈 EDGE FOUND\n\n"
-            f"{e['game']}\n"
-            f"Side: {e['team']}\n"
-            f"Ticker: {e['ticker']}\n"
-            f"Pinnacle ML: {e['pinnacle_price']}\n"
-            f"Pinnacle Prob: {e['pinnacle_prob']:.3f}\n"
-            f"Kalshi YES Ask: {e['kalshi_prob']:.3f}\n"
-            f"Edge: {e['edge'] * 100:.2f}%"
-        )
 
-        try:
-            send_telegram_message(msg)
-            already_alerted.add(key)
-            print(f"Alert sent for {key}")
-        except Exception as e2:
-            print(f"Failed to send alert for {key}: {e2}")
+def is_basketball_market(market):
+    text = " ".join([
+        str(market.get("title", "")),
+        str(market.get("subtitle", "")),
+        str(market.get("category", "")),
+        str(market.get("event_ticker", "")),
+        str(market.get("ticker", ""))
+    ]).lower()
+
+    basketball_words = [
+        "basketball", "nba", "pro basketball", "points scored",
+        "money", "spread", "total"
+    ]
+
+    return any(word in text for word in basketball_words)
+
+
+def market_price_text(market):
+    yes_ask = market.get("yes_ask")
+    yes_price = market.get("yes_price")
+    last_price = market.get("last_price")
+
+    if yes_ask is not None:
+        return f"yes_ask={yes_ask}"
+    if yes_price is not None:
+        return f"yes_price={yes_price}"
+    if last_price is not None:
+        return f"last_price={last_price}"
+    return "no price"
+
+
+def kalshi_command():
+    markets = get_kalshi_markets()
+    basketball_markets = [m for m in markets if is_basketball_market(m)]
+
+    if not basketball_markets:
+        return "No open basketball Kalshi markets found."
+
+    lines = ["🎯 Kalshi basketball markets"]
+
+    count = 0
+    for m in basketball_markets:
+        title = m.get("title", "No title")
+        ticker = m.get("ticker", "No ticker")
+        price_text = market_price_text(m)
+
+        lines.append(f"{title}\n{ticker}\n{price_text}")
+        count += 1
+
+        if count >= 25:
+            break
+
+    msg = "\n\n".join(lines)
+
+    if len(msg) > 3500:
+        msg = msg[:3500] + "\n\n...message cut off"
+
+    return msg
 
 
 # =========================
-# TELEGRAM COMMAND HANDLER
+# COMMAND HANDLER
 # =========================
 def handle_updates():
     global last_update_id
@@ -334,7 +239,6 @@ def handle_updates():
         chat = message.get("chat", {})
         text = message.get("text", "")
 
-        # Only respond to your configured chat id
         if str(chat.get("id")) != str(TELEGRAM_CHAT_ID):
             continue
 
@@ -344,49 +248,37 @@ def handle_updates():
             if text == "/start":
                 send_telegram_message(
                     "Bot is running.\n\n"
-                    "Commands:\n"
-                    "/odds - show all NBA Pinnacle odds\n"
-                    "/edge - check current Kalshi edges"
+                    "/odds = all NBA Pinnacle odds\n"
+                    "/kalshi = Kalshi basketball titles + tickers"
                 )
 
             elif text == "/odds":
                 send_telegram_message(odds_command())
 
-            elif text == "/edge":
-                send_telegram_message(edge_command())
+            elif text == "/kalshi":
+                send_telegram_message(kalshi_command())
 
         except Exception as e:
-            send_telegram_message(f"Command error: {e}")
+            send_telegram_message(f"Error: {e}")
 
 
 # =========================
-# MAIN LOOP
+# MAIN
 # =========================
 def main():
     validate_env()
     print("Bot starting...")
 
     try:
-        send_telegram_message("Kalshi Edge Bot is live.")
+        send_telegram_message("Ticker bot is live.")
     except Exception as e:
-        print(f"Startup Telegram send failed: {e}")
-
-    last_scan_time = 0
+        print(f"Startup Telegram failed: {e}")
 
     while True:
         try:
             handle_updates()
         except Exception as e:
-            print(f"Update handler error: {e}")
-
-        now = time.time()
-
-        if now - last_scan_time >= SCAN_INTERVAL:
-            try:
-                scan_and_alert()
-            except Exception as e:
-                print(f"Scan error: {e}")
-            last_scan_time = now
+            print(f"Loop error: {e}")
 
         time.sleep(COMMAND_POLL_INTERVAL)
 
