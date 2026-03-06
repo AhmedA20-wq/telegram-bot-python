@@ -3,167 +3,132 @@ import time
 import requests
 
 # =====================
-# ENV VARIABLES
+# ENV
 # =====================
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 ODDS_API = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
-KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2/markets"
+KALSHI_MARKETS_API = "https://api.elections.kalshi.com/trade-api/v2/markets"
 
 REQUEST_TIMEOUT = 20
+POLL_INTERVAL_SEC = 3
+MAX_TELEGRAM_LEN = 3500
+
 last_update_id = None
+
+
+# =====================
+# HELPERS
+# =====================
+def must_env():
+    missing = []
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if not ODDS_API_KEY:
+        missing.append("ODDS_API_KEY")
+    if missing:
+        raise RuntimeError("Missing env vars: " + ", ".join(missing))
+
+
+def cut(text: str) -> str:
+    if len(text) <= MAX_TELEGRAM_LEN:
+        return text
+    return text[:MAX_TELEGRAM_LEN] + "\n\n...message cut off"
 
 
 # =====================
 # TELEGRAM
 # =====================
-
-def send_message(text):
-
+def send_message(text: str):
     url = f"{TELEGRAM_API}/sendMessage"
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text
-    }
-
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": cut(text)}
     r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-
+    r.raise_for_status()
     return r.json()
 
 
 def get_updates():
-
     global last_update_id
-
     url = f"{TELEGRAM_API}/getUpdates"
-
-    params = {}
-
-    if last_update_id:
+    params = {"timeout": 1}
+    if last_update_id is not None:
         params["offset"] = last_update_id + 1
 
     r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-
+    r.raise_for_status()
     data = r.json()
-
-    if not data["ok"]:
+    if not data.get("ok"):
         return []
-
-    return data["result"]
+    return data.get("result", [])
 
 
 # =====================
-# ODDS API
+# ODDS API (PINNACLE)
 # =====================
-
 def get_pinnacle_odds():
-
     params = {
         "apiKey": ODDS_API_KEY,
         "bookmakers": "pinnacle",
         "markets": "h2h",
-        "oddsFormat": "american"
+        "oddsFormat": "american",
     }
 
-    r = requests.get(ODDS_API, params=params)
-
+    r = requests.get(ODDS_API, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
     data = r.json()
 
     games = []
-
     for event in data:
+        home = event.get("home_team")
+        away = event.get("away_team")
+        bookmakers = event.get("bookmakers", [])
+        if not home or not away or not bookmakers:
+            continue
 
-        home = event["home_team"]
-        away = event["away_team"]
+        markets = bookmakers[0].get("markets", [])
+        if not markets:
+            continue
 
-        bookmaker = event["bookmakers"][0]
-
-        outcomes = bookmaker["markets"][0]["outcomes"]
+        outcomes = markets[0].get("outcomes", [])
+        if len(outcomes) < 2:
+            continue
 
         prices = {}
-
         for o in outcomes:
+            name = o.get("name")
+            price = o.get("price")
+            if name is not None and price is not None:
+                prices[name] = price
 
-            prices[o["name"]] = o["price"]
+        home_price = prices.get(home)
+        away_price = prices.get(away)
+        if home_price is None or away_price is None:
+            continue
 
         games.append(
             {
                 "home": home,
                 "away": away,
-                "home_price": prices.get(home),
-                "away_price": prices.get(away)
+                "home_price": home_price,
+                "away_price": away_price,
             }
         )
 
     return games
 
 
-# =====================
-# KALSHI MARKETS
-# =====================
-
-def get_kalshi_markets():
-
-    params = {
-        "status": "open"
-    }
-
-    r = requests.get(KALSHI_API, params=params)
-
-    data = r.json()
-
-    return data.get("markets", [])
-
-
-def is_real_game_market(market):
-
-    ticker = str(market.get("ticker","")).lower()
-
-    # remove combo markets
-    if "crosscategory" in ticker:
-        return False
-
-    if "multigame" in ticker:
-        return False
-
-    title = str(market.get("title","")).lower()
-
-    # remove player props
-    if ":" in title:
-        return False
-
-    # allow spreads / totals / wins
-    keywords = [
-        "wins",
-        "points scored",
-        "over",
-        "under"
-    ]
-
-    for k in keywords:
-        if k in title:
-            return True
-
-    return False
-
-
-# =====================
-# COMMANDS
-# =====================
-
 def odds_command():
-
     games = get_pinnacle_odds()
+    if not games:
+        return "No NBA Pinnacle odds found."
 
-    lines = ["NBA Pinnacle Odds"]
-
+    lines = [f"🏀 Pinnacle NBA Odds (games={len(games)})"]
     for g in games:
-
         lines.append(
             f"{g['away']} @ {g['home']}\n"
             f"{g['away']}: {g['away_price']}\n"
@@ -173,35 +138,53 @@ def odds_command():
     return "\n\n".join(lines)
 
 
+# =====================
+# KALSHI
+# =====================
+def get_kalshi_markets(status="open", limit=200):
+    # Kalshi supports market data endpoints; we’ll just fetch and print what we get.
+    params = {
+        "status": status,
+        "limit": limit,
+    }
+    r = requests.get(KALSHI_MARKETS_API, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("markets", [])
+
+
 def kalshi_command():
+    markets = get_kalshi_markets(status="open", limit=200)
 
-    markets = get_kalshi_markets()
+    if not markets:
+        return "Kalshi returned 0 open markets (unexpected)."
 
-    filtered = []
+    lines = [f"🎯 Kalshi Markets (open={len(markets)})", "Showing first 25:"]
 
+    shown = 0
     for m in markets:
+        title = m.get("title") or "NO TITLE"
+        ticker = m.get("ticker") or "NO TICKER"
 
-        if is_real_game_market(m):
+        # Kalshi often uses cents; sometimes fields differ by endpoint/version.
+        yes_ask = m.get("yes_ask")
+        yes_bid = m.get("yes_bid")
+        last_price = m.get("last_price")
 
-            filtered.append(m)
+        price_bits = []
+        if yes_bid is not None:
+            price_bits.append(f"yes_bid={yes_bid}")
+        if yes_ask is not None:
+            price_bits.append(f"yes_ask={yes_ask}")
+        if last_price is not None and not price_bits:
+            price_bits.append(f"last={last_price}")
+        if not price_bits:
+            price_bits.append("no price fields")
 
-    lines = ["Kalshi NBA Markets"]
+        lines.append(f"{title}\n{ticker}\n{', '.join(price_bits)}")
 
-    count = 0
-
-    for m in filtered:
-
-        title = m.get("title")
-        ticker = m.get("ticker")
-        price = m.get("yes_ask")
-
-        lines.append(
-            f"{title}\n{ticker}\nyes_ask={price}"
-        )
-
-        count += 1
-
-        if count >= 20:
+        shown += 1
+        if shown >= 25:
             break
 
     return "\n\n".join(lines)
@@ -210,66 +193,51 @@ def kalshi_command():
 # =====================
 # TELEGRAM HANDLER
 # =====================
-
 def handle_updates():
-
     global last_update_id
 
     updates = get_updates()
-
     for update in updates:
-
         last_update_id = update["update_id"]
 
-        message = update.get("message", {})
+        msg = update.get("message", {})
+        chat = msg.get("chat", {})
+        text = (msg.get("text") or "").strip()
 
-        chat = message.get("chat", {})
-
-        text = message.get("text", "")
-
+        # only respond in your configured chat
         if str(chat.get("id")) != str(TELEGRAM_CHAT_ID):
             continue
 
-        text = text.lower().strip()
+        cmd = text.lower()
 
-        if text == "/start":
+        if cmd == "/start":
+            send_message("Bot running\n\n/odds = NBA odds (Pinnacle)\n/kalshi = show first 25 Kalshi markets")
 
-            send_message(
-                "Bot running\n\n"
-                "/odds = NBA odds\n"
-                "/kalshi = Kalshi markets"
-            )
-
-        if text == "/odds":
-
+        elif cmd == "/odds":
             send_message(odds_command())
 
-        if text == "/kalshi":
-
+        elif cmd == "/kalshi":
             send_message(kalshi_command())
 
 
 # =====================
-# MAIN LOOP
+# MAIN
 # =====================
-
 def main():
-
-    send_message("Bot started")
+    must_env()
+    try:
+        send_message("✅ Bot started")
+    except Exception as e:
+        print("Startup message failed:", e)
 
     while True:
-
         try:
-
             handle_updates()
-
         except Exception as e:
+            print("Loop error:", e)
 
-            print(e)
-
-        time.sleep(3)
+        time.sleep(POLL_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-
     main()
