@@ -165,6 +165,37 @@ def get_kalshi_markets():
 
 
 def is_basketball_market(market):
+
+    title = str(market.get("title","")).lower()
+
+    # ignore combo or multi markets
+    if "combo" in title:
+        return False
+
+    if "multi" in title:
+        return False
+
+    if "crosscategory" in title:
+        return False
+
+    # ignore player props
+    if ":" in title:
+        return False
+
+    # include real betting markets
+    keywords = [
+        "wins",
+        "points scored",
+        "over",
+        "under",
+        "spread"
+    ]
+
+    for k in keywords:
+        if k in title:
+            return True
+
+    return False
     text = " ".join([
         str(market.get("title", "")),
         str(market.get("subtitle", "")),
