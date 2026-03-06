@@ -1,110 +1,51 @@
 import os
+import json
 import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
-KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+def get_nba_pinnacle_games():
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "bookmakers": "pinnacle",
+        "markets": "h2h",
+        "oddsFormat": "american",
+    }
 
-
-# --------------------
-# START COMMAND
-# --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot online")
-
-
-# --------------------
-# PINNACLE ODDS
-# --------------------
-async def odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={ODDS_API_KEY}&regions=us&markets=h2h,spreads,totals&bookmakers=pinnacle"
-
-    r = requests.get(url)
-    games = r.json()
-
-    if len(games) == 0:
-        await update.message.reply_text("No games found")
-        return
-
-    game = games[0]
-
-    home = game["home_team"]
-    away = game["away_team"]
-
-    bookmakers = game["bookmakers"][0]
-    markets = bookmakers["markets"]
-
-    message = f"{away} @ {home}\n\n"
-
-    for market in markets:
-
-        if market["key"] == "h2h":
-            for o in market["outcomes"]:
-                message += f"{o['name']} ML: {o['price']}\n"
-
-        if market["key"] == "spreads":
-            for o in market["outcomes"]:
-                message += f"{o['name']} {o['point']} ({o['price']})\n"
-
-        if market["key"] == "totals":
-            for o in market["outcomes"]:
-                message += f"{o['name']} {o['point']} ({o['price']})\n"
-
-    await update.message.reply_text(message)
-
-
-# --------------------
-# KALSHI MARKET
-# --------------------
-async def kalshi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not context.args:
-        await update.message.reply_text("Usage: /kalshi MARKET_TICKER")
-        return
-
-    ticker = context.args[0]
-
-    url = f"{KALSHI_BASE}/markets/{ticker}/orderbook"
-
-    r = requests.get(url)
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
     data = r.json()
 
-    yes_orders = data["orderbook"]["yes"]
-    no_orders = data["orderbook"]["no"]
+    games = []
 
-    best_yes = yes_orders[0][0] if yes_orders else None
-    best_no = no_orders[0][0] if no_orders else None
+    for event in data:
+        home_team = event.get("home_team")
+        away_team = event.get("away_team")
+        bookmakers = event.get("bookmakers", [])
 
-    message = f"Kalshi Market: {ticker}\n\n"
+        if not bookmakers:
+            continue
 
-    if best_yes:
-        message += f"Best YES bid: {best_yes}¢\n"
+        outcomes = bookmakers[0].get("markets", [])[0].get("outcomes", [])
+        if len(outcomes) < 2:
+            continue
 
-    if best_no:
-        message += f"Best NO bid: {best_no}¢\n"
+        prices = {}
+        for outcome in outcomes:
+            prices[outcome["name"]] = outcome["price"]
 
-    await update.message.reply_text(message)
+        home_price = prices.get(home_team)
+        away_price = prices.get(away_team)
 
+        if home_price is None or away_price is None:
+            continue
 
-# --------------------
-# RUN BOT
-# --------------------
-def main():
+        games.append({
+            "home_team": home_team,
+            "away_team": away_team,
+            "home_price": home_price,
+            "away_price": away_price,
+        })
 
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("odds", odds))
-    app.add_handler(CommandHandler("kalshi", kalshi))
-
-    print("Bot running...")
-
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+    return games
